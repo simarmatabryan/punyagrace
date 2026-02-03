@@ -4,54 +4,87 @@ os.environ["VOSK_LOG_LEVEL"] = "-1"
 
 # ================== IMPORT ==================
 import sounddevice as sd
-import queue
-import json
+import queue, json, threading
+import tkinter as tk
 from vosk import Model, KaldiRecognizer
-from pythonosc import udp_client
 from rapidfuzz import fuzz
+import numpy as np
 
 # ================== CONFIG ==================
 SAMPLE_RATE = 16000
-BLOCK_SIZE = 300
-FUZZY_THRESHOLD = 80  # minimal % kemiripan agar dianggap keyword
+BLOCK_SIZE = 1024
+FUZZY_THRESHOLD = 85
+VOLUME_THRESHOLD = 300
 
 TARGET_WORDS = [
-    "distance",
-    "afraid",
-    "silent",
-    "overwhelm",
-    "honestly",
-    "realize",
-    "sorry",
-    "grateful",
-    "message"
+    "distance", "afraid", "silent", "overwhelm",
+    "honestly", "realize", "sorry", "grateful", "message"
 ]
 
 MODEL_PATH = r"C:\Users\USER\Downloads\karyaanakuph-main\karyaanakuph-main\vosk-model-small-en-us-0.15"
 
 # ================== MODEL ==================
 model = Model(MODEL_PATH)
-
-def new_recognizer():
-    rec = KaldiRecognizer(model, SAMPLE_RATE)
-    rec.SetWords(False)
-    return rec
-
-rec = new_recognizer()
-
-# ================== OSC ==================
-osc = udp_client.SimpleUDPClient("127.0.0.1", 8000)
+rec = KaldiRecognizer(model, SAMPLE_RATE)
+rec.SetWords(False)
 
 # ================== AUDIO ==================
-q = queue.Queue()
+audio_q = queue.Queue()
+speaking = False
 
-def callback(indata, frames, time_info, status):
-    q.put(bytes(indata))
+def callback(indata, frames, time, status):
+    global speaking
+    if status:
+        print(status)
 
-print("🎤 Listening (FUZZY KEYWORDS + FIRST/LAST MODE)")
+    volume = np.linalg.norm(indata)
 
-# ================== MAIN LOOP ==================
-try:
+    if volume > VOLUME_THRESHOLD:
+        speaking = True
+        audio_q.put(bytes(indata))
+    else:
+        speaking = False
+
+# ================== UI ==================
+root = tk.Tk()
+root.title("🎤 Subtitle Speech Visualizer")
+root.geometry("1200x300")
+root.configure(bg="#0b0b0b")
+
+text = tk.Text(
+    root,
+    bg="#0b0b0b",
+    fg="#eaeaea",
+    font=("Helvetica", 36),
+    wrap="word",
+    height=3,
+    bd=0
+)
+text.pack(expand=True, fill="both", padx=40, pady=60)
+
+text.tag_config("bold", font=("Helvetica", 36, "bold"))
+text.config(state="disabled")
+
+# ================== RENDER TEXT ==================
+def render_text(sentence):
+    text.config(state="normal")
+    text.delete("1.0", "end")
+
+    for word in sentence.split():
+        clean = word.lower()
+        if any(fuzz.ratio(clean, kw) >= FUZZY_THRESHOLD for kw in TARGET_WORDS):
+            text.insert("end", word.upper() + " ", "bold")
+        else:
+            text.insert("end", word + " ")
+
+    text.config(state="disabled")
+
+# ================== AUDIO LOOP ==================
+def audio_loop():
+    last_partial = ""
+
+    print("🎧 INPUT DEVICE:", sd.query_devices(kind="input"))
+
     with sd.RawInputStream(
         samplerate=SAMPLE_RATE,
         blocksize=BLOCK_SIZE,
@@ -59,47 +92,21 @@ try:
         channels=1,
         callback=callback
     ):
+        print("🎤 MIC LAPTOP AKTIF")
+
         while True:
-            audio = q.get()
+            if not speaking:
+                continue   # ❗ JANGAN HAPUS TEKS SAAT DIAM
 
-            if rec.AcceptWaveform(audio):
-                result = json.loads(rec.Result())
-                text = result.get("text", "").lower().strip()
+            data = audio_q.get()
+            rec.AcceptWaveform(data)
 
-                # reset recognizer CEPAT
-                rec = new_recognizer()
+            partial = json.loads(rec.PartialResult()).get("partial", "").strip()
 
-                if not text:
-                    continue
+            if partial and partial != last_partial:
+                last_partial = partial
+                render_text(partial)
 
-                words = text.split()
-                detected_keywords = []
-
-                # ================== FUZZY MATCHING ==================
-                for w in words:
-                    for kw in TARGET_WORDS:
-                        score = fuzz.ratio(w, kw)
-                        if score >= FUZZY_THRESHOLD:
-                            # simpan urutan tanpa duplikat berurutan
-                            if not detected_keywords or detected_keywords[-1] != kw:
-                                detected_keywords.append(kw)
-                            break  # stop cek keyword lain kalau sudah match
-
-                if not detected_keywords:
-                    continue
-
-                # ambil FIRST & LAST
-                first_kw = detected_keywords[0]
-                last_kw = detected_keywords[-1]
-
-                print(f"🎯 FIRST: {first_kw}")
-                osc.send_message("/speech/final", first_kw)
-
-                if last_kw != first_kw:
-                    print(f"🎯 LAST: {last_kw}")
-                    osc.send_message("/speech/final", last_kw)
-
-except KeyboardInterrupt:
-    print("🛑 Stopped")
-except Exception as e:
-    print("❌ Error:", e)
+# ================== START ==================
+threading.Thread(target=audio_loop, daemon=True).start()
+root.mainloop()
